@@ -8,7 +8,8 @@
     "endpoint": "https://hash-production-3375.up.railway.app/api/hashrate",
     "report_interval": 10
   },
-  "batch_size": 100,
+  "batch_size": 1000,
+  "gpu_batch_size": 10000,
   "upload_batch_size": 10000000,
   "upload_interval": 60,
   "cpu_threads": 4,

@@ -20,57 +20,72 @@ import numpy as np
 from google.cloud import bigtable
 from google.cloud.bigtable.row import DirectRow
 
-# GPU imports - will handle gracefully if not available
-try:
-    import cupy as cp
-    from numba import cuda
-    import pycuda.driver as cuda_driver
-    import pycuda.autoinit
-    GPU_AVAILABLE = True
-except ImportError:
-    GPU_AVAILABLE = False
-    cp = None
-
-# Configure logging
+# Configure logging first
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+# GPU imports - will handle gracefully if not available
+GPU_AVAILABLE = False
+cp = None
+
+try:
+    import cupy as cp
+    # Test if CUDA is actually available
+    gpu_count = cp.cuda.runtime.getDeviceCount()
+    if gpu_count > 0:
+        GPU_AVAILABLE = True
+        logger.info(f"CUDA initialized successfully with {gpu_count} GPU(s)")
+    else:
+        logger.info("No CUDA devices found, using CPU mode")
+except (ImportError, RuntimeError, Exception) as e:
+    # No GPU available or CUDA initialization failed
+    GPU_AVAILABLE = False
+    cp = None
+    logger.info(f"GPU support not available: {type(e).__name__}")
+
 
 class GPUHasher:
-    """GPU-accelerated SHA256 hasher using CUDA"""
+    """Batch SHA256 hasher for GPU/CPU processing"""
     
-    def __init__(self, device_id: int):
+    def __init__(self, device_id: int, batch_size: int = 10000):
         self.device_id = device_id
-        if GPU_AVAILABLE:
-            with cp.cuda.Device(device_id):
-                self.device = cp.cuda.Device(device_id)
-                self.stream = cp.cuda.Stream()
-    
-    def hash_batch_gpu(self, inputs: np.ndarray) -> List[bytes]:
-        """Hash a batch of inputs on GPU"""
-        if not GPU_AVAILABLE:
-            return self.hash_batch_cpu(inputs)
+        self.batch_size = batch_size
         
-        with cp.cuda.Device(self.device_id):
-            # Convert to GPU array
-            gpu_inputs = cp.asarray(inputs)
-            results = []
-            
-            # Process on GPU (simplified - in production would use custom CUDA kernel)
-            for inp in inputs:
-                # For now, fall back to CPU SHA256
-                # In production, you'd implement a CUDA kernel for SHA256
-                hash_val = hashlib.sha256(inp).digest()
-                results.append(hash_val)
-            
-            return results
+        # Initialize GPU if available
+        if GPU_AVAILABLE and device_id >= 0:
+            try:
+                cp.cuda.Device(device_id).use()
+                logger.info(f"GPU {device_id} initialized for batch processing")
+            except Exception as e:
+                logger.warning(f"Failed to initialize GPU {device_id}: {e}")
+                self.device_id = -1
     
-    def hash_batch_cpu(self, inputs: np.ndarray) -> List[bytes]:
-        """Fallback CPU hashing"""
-        return [hashlib.sha256(inp).digest() for inp in inputs]
+    def hash_batch(self, inputs: List[bytes]) -> List[bytes]:
+        """Hash a batch of hex string inputs"""
+        results = []
+        
+        # Process in chunks
+        for i in range(0, len(inputs), self.batch_size):
+            chunk = inputs[i:i+self.batch_size]
+            
+            if GPU_AVAILABLE and self.device_id >= 0:
+                # GPU path - future optimization: use GPU SHA256 kernel
+                # For now, we batch on GPU memory but compute on CPU
+                with cp.cuda.Device(self.device_id):
+                    for hex_bytes in chunk:
+                        # hex_bytes is already the 64-char hex string as bytes
+                        hash_val = hashlib.sha256(hex_bytes).digest()
+                        results.append(hash_val)
+            else:
+                # CPU path
+                for hex_bytes in chunk:
+                    hash_val = hashlib.sha256(hex_bytes).digest()
+                    results.append(hash_val)
+        
+        return results
 
 
 class SparseInputGenerator:
@@ -89,26 +104,15 @@ class SparseInputGenerator:
         return f"{hostname}_{timestamp}_{secrets.token_hex(4)}"
     
     def generate_batch(self, batch_size: int) -> List[bytes]:
-        """Generate a batch of sparse input values"""
+        """Generate a batch of 64-character hex strings (0-9, a-f)"""
         inputs = []
         for _ in range(batch_size):
-            # Combine multiple entropy sources for maximum coverage
-            entropy_sources = [
-                self.counter.to_bytes(8, 'big'),
-                secrets.token_bytes(8),  # Random component
-                self.instance_id.encode()[:8].ljust(8, b'\x00'),  # Instance-specific
-                int(time.time_ns()).to_bytes(8, 'big'),  # Time-based
-                secrets.token_bytes(8)  # Additional randomness
-            ]
-            
-            # Combine and hash to create 32-byte input
-            combined = b''.join(entropy_sources)
-            input_hash = hashlib.sha256(combined).digest()
-            inputs.append(input_hash)
-            
-            # Jump by prime-like amount for sparse distribution
-            self.counter = (self.counter * 6364136223846793005 + self.jump_size) & ((1 << 64) - 1)
-        
+            # Generate 32 random bytes
+            random_bytes = secrets.token_bytes(32)
+            # Convert to 64-character hex string (lowercase)
+            hex_string = random_bytes.hex().lower()
+            # Convert hex string to bytes for hashing
+            inputs.append(hex_string.encode('utf-8'))
         return inputs
 
 
@@ -153,9 +157,9 @@ class HashGenerator:
     
     def _init_gpu_hashers(self):
         """Initialize GPU hashers for all available GPUs"""
-        if GPU_AVAILABLE:
+        if GPU_AVAILABLE and cp is not None:
             try:
-                gpu_count = cuda_driver.Device.count()
+                gpu_count = cp.cuda.runtime.getDeviceCount()
                 logger.info(f"Detected {gpu_count} GPU(s)")
                 for i in range(gpu_count):
                     self.hashers.append(GPUHasher(i))
@@ -167,7 +171,7 @@ class HashGenerator:
             logger.info("No GPUs available, using CPU")
             # Create CPU-based hashers
             for _ in range(self.config.get('cpu_threads', 4)):
-                self.hashers.append(GPUHasher(-1))  # -1 indicates CPU
+                self.hashers.append(GPUHasher(-1, batch_size=1000))  # -1 indicates CPU
     
     async def bulk_upsert_bigtable(self, inputs: List[bytes], hashes: List[bytes]):
         """Bulk upsert to BigTable"""
@@ -243,34 +247,40 @@ class HashGenerator:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             self.executor,
-            hasher.hash_batch_cpu,  # Using CPU for now
-            np.array(inputs)
+            hasher.hash_batch,
+            inputs
         )
     
     async def hash_worker(self, hasher_id: int):
         """Worker coroutine for continuous hashing"""
+        if hasher_id >= len(self.hashers):
+            logger.error(f"Worker {hasher_id} has no hasher assigned")
+            return
+            
         hasher = self.hashers[hasher_id]
-        batch_size = self.config.get('batch_size', 100)
+        # Use larger batches for GPU efficiency
+        batch_size = self.config.get('gpu_batch_size', 10000) if hasher.device_id >= 0 else self.config.get('batch_size', 1000)
         
         while True:
             try:
-                # Generate sparse inputs
+                # Generate batch of random inputs
                 inputs = self.input_generator.generate_batch(batch_size)
                 
                 # Compute hashes
                 hashes = await self.process_batch(hasher, inputs)
                 
                 # Add to buffer
-                for inp, hsh in zip(inputs, hashes):
-                    self.batch_buffer.append((inp, hsh))
+                for i in range(len(hashes)):
+                    # inputs[i] is already the hex string as bytes
+                    self.batch_buffer.append((inputs[i], hashes[i]))
                     self.total_hashes += 1
                 
                 # Check if we need to upload
-                if len(self.batch_buffer) >= self.config.get('upload_batch_size', 1000):
+                if len(self.batch_buffer) >= self.config.get('upload_batch_size', 10000000):
                     await self.upload_and_report()
                 
             except Exception as e:
-                logger.error(f"Worker {hasher_id} error: {e}")
+                logger.error(f"Worker {hasher_id} error: {e}", exc_info=True)
                 await asyncio.sleep(1)
     
     async def upload_and_report(self):
