@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  hash-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hash-generator:latest
+    container_name: hash-generator
+    
+    # GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Environment variables
+    environment:
+      # Google Cloud credentials (mount your service account key)
+      GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/service-account.json
+      
+      # BigTable configuration
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID:-your-project-id}
+      BT_INSTANCE_ID: ${BT_INSTANCE_ID:-your-instance-id}
+      BT_TABLE_NAME: ${BT_TABLE_NAME:-hashes}
+      
+      # Monitoring endpoint
+      MONITORING_ENDPOINT: ${MONITORING_ENDPOINT:-http://monitoring-server:8080/api/hashrate}
+      
+      # Performance tuning
+      BATCH_SIZE: ${BATCH_SIZE:-100}
+      UPLOAD_BATCH_SIZE: ${UPLOAD_BATCH_SIZE:-1000}
+      UPLOAD_INTERVAL: ${UPLOAD_INTERVAL:-10}
+      CPU_THREADS: ${CPU_THREADS:-4}
+      
+      # CUDA settings
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}
+    
+    # Volume mounts
+    volumes:
+      # Mount GCP credentials
+      - ./credentials:/app/credentials:ro
+      
+      # Optional: Mount custom config
+      - ./config.json:/app/config.json:ro
+      
+      # Logs volume
+      - ./logs:/app/logs
+    
+    # Network configuration
+    networks:
+      - hashnet
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Resource limits
+    mem_limit: ${MEM_LIMIT:-4g}
+    cpus: ${CPU_LIMIT:-2.0}
+    
+    # Logging configuration
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Monitoring server for receiving hashrate reports
+  monitoring-server:
+    image: nginx:alpine
+    container_name: monitoring-server
+    volumes:
+      - ./monitoring/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:8080"
+    networks:
+      - hashnet
+    restart: unless-stopped
+
+networks:
+  hashnet:
+    driver: bridge

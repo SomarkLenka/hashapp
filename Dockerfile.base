@@ -1,0 +1,32 @@
+# Optimized base image with all dependencies pre-installed
+FROM nvidia/cuda:12.3.1-devel-ubuntu22.04 as base
+
+# Install Python and all build dependencies in single layer
+RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-dev \
+    python3-pip \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+
+# Pre-install ALL Python dependencies from requirements
+COPY requirements.txt /tmp/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --no-cache-dir -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
+
+# Create app user
+RUN useradd -m -u 1000 appuser
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    CUDA_VISIBLE_DEVICES=all \
+    PATH="/home/appuser/.local/bin:${PATH}"
+
+# Set working directory
+WORKDIR /app
+
+# Default to non-root user
+USER appuser

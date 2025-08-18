@@ -1,0 +1,12 @@
+# Core dependencies
+google-cloud-bigtable==2.23.0
+aiohttp==3.9.5
+numpy==1.26.4
+
+# GPU support (optional - will work without these)
+cupy-cuda12x==13.1.0  # For CUDA 12.x
+pycuda==2024.1
+numba==0.59.1
+
+# Monitoring and logging
+python-json-logger==2.0.7
