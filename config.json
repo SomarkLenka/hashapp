@@ -10,7 +10,7 @@
   },
   "batch_size": 1000,
   "gpu_batch_size": 10000,
-  "upload_batch_size": 10000000,
+  "upload_batch_size": 5000000,
   "upload_interval": 60,
   "cpu_threads": 4,
   "gpu_settings": {

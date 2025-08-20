@@ -33,18 +33,38 @@ cp = None
 
 try:
     import cupy as cp
+    # Check CUDA_VISIBLE_DEVICES environment variable first
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+    
     # Test if CUDA is actually available
-    gpu_count = cp.cuda.runtime.getDeviceCount()
-    if gpu_count > 0:
+    try:
+        # First check if we can access any GPU
+        test_device = cp.cuda.Device(0)
         GPU_AVAILABLE = True
-        logger.info(f"CUDA initialized successfully with {gpu_count} GPU(s)")
-    else:
-        logger.info("No CUDA devices found, using CPU mode")
-except (ImportError, RuntimeError, Exception) as e:
-    # No GPU available or CUDA initialization failed
+        
+        # Count actual accessible GPUs
+        gpu_count = 0
+        for i in range(16):
+            try:
+                with cp.cuda.Device(i):
+                    _ = cp.zeros(1)  # Test if GPU is actually usable
+                gpu_count += 1
+            except:
+                break
+        
+        if gpu_count > 0:
+            logger.info(f"CUDA initialized successfully with {gpu_count} accessible GPU(s)")
+        else:
+            GPU_AVAILABLE = False
+            logger.warning("GPUs detected but none are accessible")
+    except Exception as e:
+        GPU_AVAILABLE = False
+        cp = None
+        logger.info(f"GPU support not available: {e}")
+except ImportError as e:
     GPU_AVAILABLE = False
     cp = None
-    logger.info(f"GPU support not available: {type(e).__name__}")
+    logger.info("CuPy not installed, using CPU mode")
 
 
 class GPUHasher:
@@ -159,10 +179,26 @@ class HashGenerator:
         """Initialize GPU hashers for all available GPUs"""
         if GPU_AVAILABLE and cp is not None:
             try:
-                gpu_count = cp.cuda.runtime.getDeviceCount()
-                logger.info(f"Detected {gpu_count} GPU(s)")
-                for i in range(gpu_count):
-                    self.hashers.append(GPUHasher(i))
+                # Try to detect GPUs that are actually accessible
+                gpu_count = 0
+                accessible_gpus = []
+                
+                for i in range(16):  # Check up to 16 GPUs
+                    try:
+                        with cp.cuda.Device(i):
+                            _ = cp.zeros(1)  # Test if GPU is actually usable
+                        accessible_gpus.append(i)
+                        gpu_count += 1
+                    except:
+                        continue  # Try next GPU
+                
+                if gpu_count > 0:
+                    logger.info(f"Found {gpu_count} accessible GPU(s): {accessible_gpus}")
+                    for gpu_id in accessible_gpus:
+                        self.hashers.append(GPUHasher(gpu_id, batch_size=10000))
+                else:
+                    logger.warning("No accessible GPUs found, falling back to CPU")
+                    self.hashers = []
             except Exception as e:
                 logger.warning(f"GPU initialization failed: {e}")
                 self.hashers = []
@@ -176,9 +212,15 @@ class HashGenerator:
     async def bulk_upsert_bigtable(self, inputs: List[bytes], hashes: List[bytes]):
         """Bulk upsert to BigTable"""
         if not self.bt_table:
+            logger.warning("BigTable not initialized, skipping upload")
             return
         
         try:
+            # Check if table exists
+            if not self.bt_table.exists():
+                logger.error(f"BigTable table '{self.config['bigtable']['table_name']}' does not exist!")
+                return
+            
             rows = []
             for input_bytes, hash_bytes in zip(inputs, hashes):
                 # Use hash as row key for faster lookups
@@ -192,15 +234,20 @@ class HashGenerator:
                 )
                 rows.append(row)
             
-            # Batch mutation
-            await asyncio.get_event_loop().run_in_executor(
-                self.executor,
-                self.bt_table.mutate_rows,
-                rows
-            )
-            logger.info(f"Uploaded {len(rows)} hashes to BigTable")
+            # Batch mutation in smaller chunks to avoid timeouts
+            chunk_size = 1000
+            for i in range(0, len(rows), chunk_size):
+                chunk = rows[i:i+chunk_size]
+                await asyncio.get_event_loop().run_in_executor(
+                    self.executor,
+                    self.bt_table.mutate_rows,
+                    chunk
+                )
+                logger.info(f"Uploaded batch {i//chunk_size + 1}: {len(chunk)} hashes to BigTable")
+            
+            logger.info(f"Total uploaded: {len(rows)} hashes to BigTable")
         except Exception as e:
-            logger.error(f"BigTable upload failed: {e}")
+            logger.error(f"BigTable upload failed: {e}", exc_info=True)
     
     async def report_hashrate(self):
         """Report hashrate to web server"""
@@ -276,8 +323,13 @@ class HashGenerator:
                     self.total_hashes += 1
                 
                 # Check if we need to upload
-                if len(self.batch_buffer) >= self.config.get('upload_batch_size', 10000000):
+                buffer_size = len(self.batch_buffer)
+                upload_threshold = self.config.get('upload_batch_size', 100000)
+                if buffer_size >= upload_threshold:
+                    logger.info(f"Buffer reached {buffer_size}/{upload_threshold}, uploading...")
                     await self.upload_and_report()
+                elif buffer_size > 0 and buffer_size % 10000 == 0:
+                    logger.debug(f"Buffer size: {buffer_size}/{upload_threshold}")
                 
             except Exception as e:
                 logger.error(f"Worker {hasher_id} error: {e}", exc_info=True)
@@ -302,10 +354,17 @@ class HashGenerator:
     
     async def periodic_upload(self):
         """Periodically upload any remaining hashes"""
+        upload_interval = self.config.get('upload_interval', 30)
+        logger.info(f"Starting periodic uploader (every {upload_interval} seconds)")
+        
         while True:
-            await asyncio.sleep(self.config.get('upload_interval', 10))
-            if self.batch_buffer:
+            await asyncio.sleep(upload_interval)
+            buffer_size = len(self.batch_buffer)
+            if buffer_size > 0:
+                logger.info(f"Periodic upload triggered, buffer size: {buffer_size}")
                 await self.upload_and_report()
+            else:
+                logger.debug("Periodic upload: buffer empty")
     
     async def periodic_monitoring(self):
         """Report status to monitoring server every N seconds"""

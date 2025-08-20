@@ -6,7 +6,9 @@ FROM ${BASE_IMAGE}
 USER root
 
 # Copy application files with proper ownership
-COPY --chown=appuser:appuser hash_generator.py config.json credentials.json ./
+COPY --chown=appuser:appuser hash_generator_throttled.py config.json credentials.json ./
+# Rename to hash_generator.py for compatibility
+RUN mv hash_generator_throttled.py hash_generator.py
 
 # Copy verification scripts
 COPY --chown=appuser:appuser verify_hashgen.sh verify_inside_container.py ./

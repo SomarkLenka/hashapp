@@ -1,0 +1,38 @@
+# GPU-optimized Dockerfile with CUDA support
+FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
+
+# Install Python and dependencies
+RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3-pip \
+    python3.11-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Create non-root user
+RUN useradd -m -s /bin/bash appuser && chown -R appuser:appuser /app
+
+# Install Python packages
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Install CuPy with CUDA 11.x support
+RUN pip3 install cupy-cuda11x
+
+# Copy application files
+COPY --chown=appuser:appuser hash_generator.py config.json credentials.json ./
+COPY --chown=appuser:appuser verify_hashgen.sh verify_inside_container.py ./
+RUN chmod +x verify_hashgen.sh
+
+# Switch to non-root user
+USER appuser
+
+# Set environment variables
+ENV CONFIG_PATH=/app/config.json \
+    GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json \
+    CUDA_VISIBLE_DEVICES=all
+
+# Run the application
+CMD ["python3", "hash_generator.py"]
